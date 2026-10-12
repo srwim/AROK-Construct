@@ -23,6 +23,7 @@ cargo test               # proxy, store, streaming, differ
 pip install openai anthropic   # optional: enables the real-SDK tests
 python -m unittest       # Python SDK + real OpenAI/Anthropic SDKs through the binary
 python demo.py           # record, replay offline, fork, diff, render timeline
+python live_check.py     # real Claude agent: record, replay offline (needs ANTHROPIC_API_KEY)
 ```
 
 No network, no API keys. The demo records a 3-step agent run (a real tool call
