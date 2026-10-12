@@ -497,17 +497,13 @@ fn plain(s: &str) -> String {
     s.to_string()
 }
 
-fn udiff(a: &Value, b: &Value) -> String {
+fn udiff_raw(a: &Value, b: &Value) -> String {
     let (pa, pb) = (pretty(a) + "\n", pretty(b) + "\n");
-    TextDiff::from_lines(&pa, &pb)
-        .unified_diff()
-        .context_radius(2)
-        .header("a", "b")
-        .to_string()
-        .lines()
-        .map(|l| format!("      {l}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    TextDiff::from_lines(&pa, &pb).unified_diff().context_radius(2).header("a", "b").to_string()
+}
+
+fn udiff(a: &Value, b: &Value) -> String {
+    udiff_raw(a, b).lines().map(|l| format!("      {l}")).collect::<Vec<_>>().join("\n")
 }
 
 fn cmd_diff(c: &Connection, ra: &str, rb: &str) -> R<()> {
@@ -568,88 +564,300 @@ fn cmd_diff(c: &Connection, ra: &str, rb: &str) -> R<()> {
     Ok(())
 }
 
-// ---------- HTML timeline viewer ----------
+// ---------- HTML timeline viewer (see DESIGN.md) ----------
 
+// ponytail: system font stacks only; the timeline is an audit artifact and must make no network requests
 const CSS: &str = "
-:root{--bg:#fafafa;--fg:#1a1a1a;--muted:#666;--card:#fff;--line:#ddd;--pre:#f4f4f4}
-@media (prefers-color-scheme:dark){:root{--bg:#141414;--fg:#e8e8e8;--muted:#999;--card:#1e1e1e;--line:#333;--pre:#262626}}
-body{font:14px/1.45 system-ui,sans-serif;margin:24px;background:var(--bg);color:var(--fg)}
-h1{font-size:18px;margin:0 0 4px} .meta{color:var(--muted);margin-bottom:16px;font-size:13px}
-.colhead{font-weight:600;padding:4px 0}
-.row{display:grid;grid-template-columns:repeat(var(--cols),1fr);gap:12px;margin-bottom:10px}
-.card{background:var(--card);border:1px solid var(--line);border-radius:6px;padding:8px 10px;min-width:0}
-.row.div .card{border-color:#e08a00}
-.badge{display:inline-block;font-size:11px;padding:1px 6px;border-radius:8px;margin-right:6px;background:#eee;color:#1a1a1a}
-.badge.live{background:#ffe2b8}.badge.cache{background:#d5ecd5}.badge.effect{background:#dde4ff}
-summary{cursor:pointer;overflow-wrap:anywhere}
-pre{white-space:pre-wrap;word-break:break-word;background:var(--pre);padding:8px;border-radius:4px;font-size:12px}
-del{background:#ffd7d7;color:#1a1a1a;text-decoration:line-through}ins{background:#c9f0c9;color:#1a1a1a;text-decoration:none}
-.diff{grid-column:1/-1;background:var(--card);border:1px dashed #e0b25e;border-radius:6px;padding:8px 10px;font-size:13px}
-.card.empty{color:var(--muted);border-style:dashed}
+:root{color-scheme:light dark;
+--ground:oklch(0.955 0.012 85);--raised:oklch(0.978 0.008 85);--ink:oklch(0.25 0.02 150);
+--ink-2:oklch(0.47 0.015 150);--ink-3:oklch(0.53 0.012 150);--rule:oklch(0.86 0.014 85);
+--accent:oklch(0.63 0.17 45);--accent-ink:oklch(0.5 0.15 42);
+--del:oklch(0.45 0.13 30);--del-bg:oklch(0.91 0.045 30);--ins:oklch(0.38 0.08 150);--ins-bg:oklch(0.91 0.045 150);
+--sans:system-ui,-apple-system,'Segoe UI',sans-serif;
+--serif:'Iowan Old Style','Palatino Linotype',Palatino,Georgia,serif;
+--mono:ui-monospace,'Cascadia Mono','SF Mono',Menlo,Consolas,monospace}
+@media (prefers-color-scheme:dark){:root{
+--ground:oklch(0.205 0.01 150);--raised:oklch(0.24 0.012 150);--ink:oklch(0.92 0.018 85);
+--ink-2:oklch(0.74 0.014 85);--ink-3:oklch(0.62 0.012 85);--rule:oklch(0.33 0.012 150);
+--accent:oklch(0.72 0.15 52);--accent-ink:oklch(0.8 0.12 55);
+--del:oklch(0.86 0.07 30);--del-bg:oklch(0.33 0.06 30);--ins:oklch(0.88 0.07 150);--ins-bg:oklch(0.32 0.05 150)}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ground);color:var(--ink);font:14px/1.5 var(--sans);font-variant-numeric:tabular-nums}
+.wrap{max-width:1200px;margin:0 auto;padding:40px 24px 64px}
+.brand{margin:0 0 14px;font-size:12px;color:var(--ink-3)}
+h1{margin:0 0 8px;font:400 28px/1.2 var(--serif);overflow-wrap:anywhere}
+h1 .vs{color:var(--ink-3);font-size:18px;margin:0 .35em}
+.lede{margin:0 0 20px;font-size:16px;max-width:72ch}
+a{color:var(--accent-ink);text-underline-offset:3px}
+.runs{margin:0 0 36px;display:grid;gap:4px;font-size:13px;color:var(--ink-2)}
+.runs div{display:flex;flex-wrap:wrap;column-gap:16px}
+.runs dt{color:var(--ink);font-weight:600;min-width:12ch}
+.runs dd{margin:0;overflow-wrap:anywhere}
+.colheads,.step{display:grid;grid-template-columns:var(--grid);column-gap:24px}
+.colheads{position:sticky;top:0;z-index:1;background:var(--ground);border-bottom:1px solid var(--rule);padding:10px 0;font-size:13px;font-weight:600}
+.step{border-bottom:1px solid var(--rule);padding:16px 0}
+.gutter{position:relative;padding-left:18px;font-size:13px;color:var(--ink-3)}
+.gutter::before{content:'';position:absolute;left:5px;top:-16px;bottom:-17px;width:1px;background:var(--rule)}
+.after .gutter::before{background:var(--accent)}
+.diverged .gutter::after{content:'';position:absolute;left:2px;top:.5em;width:7px;height:7px;border-radius:50%;background:var(--accent)}
+.diverged .gutter .n{color:var(--accent-ink);font-weight:600}
+.cell{min-width:0}
+.span,.change{grid-column:2/-1}
+.who{display:none}
+.what{margin:0;font-weight:600}
+.target{margin-left:.4em;font:12px var(--mono);font-weight:400;color:var(--ink-2)}
+.facts{margin:2px 0 6px;font-size:12px;color:var(--ink-3)}
+.bad{color:var(--accent-ink);font-weight:600}
+.sum{margin:0;max-width:72ch;overflow-wrap:anywhere;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}
+.same .what{font-weight:500;color:var(--ink-2)}
+.same .sum{color:var(--ink-3)}
+code{font:12px var(--mono)}
+details{margin-top:8px}
+summary{width:fit-content;cursor:pointer;font-size:12px;color:var(--ink-2)}
+summary:hover{color:var(--ink)}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.ev h4,.change h3{margin:14px 0 4px;font:600 12px/1.4 var(--sans);color:var(--ink-2)}
+pre{margin:0;padding:10px 12px;max-height:28rem;overflow:auto;background:var(--raised);border-radius:2px;font:12px/1.5 var(--mono);white-space:pre-wrap;overflow-wrap:anywhere}
+.hash{margin:6px 0 0;font:11px var(--mono);color:var(--ink-3)}
+.change{margin-top:16px;padding-top:12px;border-top:1px solid var(--accent)}
+.change-head{margin:0;font-size:12px;font-weight:600;color:var(--accent-ink)}
+.udiff{max-height:none}
+.udiff span{display:block;min-height:1.5em}
+.udiff .d{background:var(--del-bg);color:var(--del)}
+.udiff .i{background:var(--ins-bg);color:var(--ins)}
+.udiff .h{color:var(--ink-3)}
+.words{margin:0;max-width:80ch}
+del{background:var(--del-bg);color:var(--del);text-decoration:line-through;text-decoration-thickness:1px}
+ins{background:var(--ins-bg);color:var(--ins);text-decoration:none}
+.missing{margin:0;color:var(--ink-3);font-style:italic}
+footer{margin-top:40px;font-size:12px;color:var(--ink-3)}
+@media (max-width:720px){
+.wrap{padding:24px 16px 48px}
+.colheads{display:none}
+.step{display:block;position:relative;padding-left:2.25rem}
+.gutter{position:absolute;left:0;top:16px;bottom:16px;width:2rem;padding-left:16px}
+.cell+.cell,.cell+.change{margin-top:16px}
+.who{display:block;margin:0 0 2px;font-size:12px;font-weight:600;color:var(--ink-2)}}
+@media print{body{background:none}.colheads{position:static}pre{max-height:none}.step{break-inside:avoid}}
 ";
 
 fn esc(s: &str) -> String {
     s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\'', "&#x27;")
 }
 
-fn card(c: &Connection, e: Option<&Ev>) -> R<String> {
-    let Some(e) = e else { return Ok(r#"<div class="card empty">&mdash;</div>"#.into()) };
-    let r = resp_obj(c, e)?;
-    let (head, prev, full) = if e.typ == "effect" {
+fn clip(s: &str, n: usize) -> String {
+    if s.chars().count() <= n { s.into() } else { s.chars().take(n).collect::<String>() + "…" }
+}
+
+fn kind(e: &Ev) -> &'static str {
+    if e.typ == "effect" { "Effect" } else { "LLM call" }
+}
+
+fn src_label(e: &Ev) -> &'static str {
+    if e.src == "cache" { "replayed" } else { "live" }
+}
+
+/// `search(limit: 3, query: "volcanoes")` from normalized tool calls.
+fn tool_line(tools: &Value) -> String {
+    tools
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|t| {
+            let args = match &t["args"] {
+                Value::Object(m) => m.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join(", "),
+                v => v.to_string(),
+            };
+            format!("{}({args})", t["name"].as_str().unwrap_or("?"))
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn udiff_html(a: &Value, b: &Value) -> String {
+    let lines: String = udiff_raw(a, b)
+        .lines()
+        .skip(2) // "--- a" / "+++ b"
+        .map(|l| {
+            let cls = match l.as_bytes().first() {
+                Some(b'@') => "h",
+                Some(b'+') => "i",
+                Some(b'-') => "d",
+                _ => "x",
+            };
+            format!(r#"<span class="{cls}">{}</span>"#, esc(l))
+        })
+        .collect();
+    format!(r#"<pre class="udiff">{lines}</pre>"#)
+}
+
+/// One run's step: what it was, where it came from, a short summary, and the evidence.
+fn cell(c: &Connection, e: &Ev, who: &str, sources: &str, span: bool) -> R<String> {
+    let (req, resp) = (jget(c, &e.req)?, resp_obj(c, e)?);
+    let mut facts = vec![esc(sources)];
+    if let Some(m) = req["model"].as_str().filter(|_| e.typ == "llm_call") {
+        facts.push(esc(m));
+    }
+    if e.status != 200 {
+        facts.push(format!(r#"<span class="bad">HTTP {}</span>"#, e.status));
+    }
+    let streamed = e.ctype.as_deref().unwrap_or("").starts_with("text/event-stream");
+    let (summary, evidence) = if e.typ == "effect" {
         (
-            format!(r#"<span class="badge effect">effect</span><span class="badge {0}">{0}</span><b>{1}</b>"#, e.src, esc(e.label())),
-            r.to_string(),
-            format!("args:\n{}\n\nresult:\n{}", pretty(&jget(c, &e.req)?), pretty(&r)),
+            format!("Returned <code>{}</code>", esc(&clip(&resp.to_string(), 200))),
+            [("Arguments", &req), ("Result", &resp)],
         )
     } else {
-        let (text, tools) = assistant_payload(&r);
-        (
-            format!(r#"<span class="badge {0}">{0}</span><b>{1}</b>"#, e.src, esc(e.label())),
-            if text.is_empty() { tools.to_string() } else { text },
-            pretty(&json!({ "request": jget(c, &e.req)?, "response": r })),
-        )
+        let (text, tools) = assistant_payload(&resp);
+        let summary = if !text.is_empty() {
+            esc(&clip(&text, 280))
+        } else if tools.as_array().is_some_and(|t| !t.is_empty()) {
+            format!("Calls <code>{}</code>", esc(&clip(&tool_line(&tools), 200)))
+        } else {
+            r#"<span class="missing">No text or tool calls.</span>"#.into()
+        };
+        let resp_head = if streamed { "Response (reassembled from a stream)" } else { "Response" };
+        (summary, [("Request", &req), (resp_head, &resp)])
     };
-    let prev: String = prev.chars().take(110).collect();
+    let ev: String = evidence.iter().map(|(h, v)| format!("<h4>{h}</h4><pre>{}</pre>", esc(&pretty(v)))).collect();
     Ok(format!(
-        r#"<div class="card"><details><summary>{head} {}</summary><pre>{}</pre></details></div>"#,
-        esc(&prev),
-        esc(&full)
+        r#"<div class="cell{span}"><p class="who">{who}</p><p class="what">{kind}<span class="target">{target}</span></p><p class="facts">{facts}</p><p class="sum">{summary}</p><details><summary>Evidence</summary><div class="ev">{ev}<p class="hash">key {key} &middot; response {resp}</p></div></details></div>"#,
+        span = if span { " span" } else { "" },
+        who = esc(who),
+        kind = kind(e),
+        target = esc(e.label()),
+        facts = facts.join(" &middot; "),
+        key = &e.key[..12],
+        resp = &e.resp[..12],
+    ))
+}
+
+/// What differs between two runs at one step: request, response, tool calls (or effect args/result).
+/// `carried`: the first divergence, when this step comes after it; its request diff then
+/// repeats inherited changes, so it is folded instead of shown open.
+fn change(c: &Connection, i: usize, x: &Ev, y: &Ev, ra: &str, rb: &str, carried: Option<usize>) -> R<String> {
+    let mut parts = String::new();
+    if x.typ != y.typ {
+        parts = format!(
+            "<p>Different kinds of step: {} {} in {}, {} {} in {}.</p>",
+            kind(x), esc(x.label()), esc(ra), kind(y), esc(y.label()), esc(rb)
+        );
+    } else {
+        let (qa, qb, pa, pb) = (jget(c, &x.req)?, jget(c, &y.req)?, resp_obj(c, x)?, resp_obj(c, y)?);
+        let mut add = |h: &str, body: String| parts += &format!("<h3>{h}</h3>{body}");
+        if x.typ == "effect" {
+            if qa != qb {
+                add("Arguments", udiff_html(&qa, &qb));
+            }
+            if pa != pb {
+                add("Result", udiff_html(&pa, &pb));
+            }
+        } else {
+            if qa != qb {
+                let diff = udiff_html(&qa, &qb);
+                add("Request", match carried {
+                    Some(d) => format!("<details><summary>Show request diff (carries the change from step {d})</summary>{diff}</details>"),
+                    None => diff,
+                });
+            }
+            let ((ta, tools_a), (tb, tools_b)) = (assistant_payload(&pa), assistant_payload(&pb));
+            if ta != tb {
+                let words = word_diff(&ta, &tb, esc, ["<del>", "</del>"], ["<ins>", "</ins>"]);
+                add("Response", format!(r#"<p class="words">{words}</p>"#));
+            }
+            if tools_a != tools_b {
+                add("Tool calls", udiff_html(&tools_a, &tools_b));
+            }
+            if x.status != y.status {
+                add("Status", format!("<p>HTTP {} in {}, HTTP {} in {}.</p>", x.status, esc(ra), y.status, esc(rb)));
+            }
+        }
+    }
+    Ok(format!(r#"<div class="change"><p class="change-head">What changed at step {i}</p>{parts}</div>"#))
+}
+
+fn render_view(c: &Connection, runs: &[String]) -> R<String> {
+    let cols = runs.iter().map(|r| timeline(c, r)).collect::<R<Vec<_>>>()?;
+    let n = cols.iter().map(Vec::len).max().unwrap_or(0);
+    let same_at = |i: usize| {
+        runs.len() > 1
+            && cols[0].get(i).is_some_and(|f| cols.iter().all(|col| col.get(i).is_some_and(|e| e.key == f.key && e.resp == f.resp)))
+    };
+    let first_div = if runs.len() > 1 { (0..n).find(|&i| !same_at(i)) } else { None };
+
+    let lede = match (runs.len(), first_div) {
+        (_, _) if n == 0 => if runs.len() == 1 { "This run recorded no steps." } else { "These runs recorded no steps." }.to_string(),
+        (1, _) => {
+            let live = cols[0].iter().filter(|e| e.src == "live").count();
+            format!("{n} steps: {live} live, {} replayed.", n - live)
+        }
+        (_, None) => format!("Identical across all {n} steps."),
+        (_, Some(0)) => r##"Diverges at the first step. <a href="#step-0">Go to step 0</a>"##.to_string(),
+        (_, Some(d)) => format!(r##"Identical through step {}; diverges at step {d}. <a href="#step-{d}">Go to step {d}</a>"##, d - 1),
+    };
+
+    let mut facts = String::new();
+    for (r, col) in runs.iter().zip(&cols) {
+        let (mode, parent, upstream, model, when): (String, Option<String>, Option<String>, Option<String>, String) = c.query_row(
+            "SELECT mode, parent, upstream, model_sub, strftime('%Y-%m-%d %H:%M', ts, 'unixepoch', 'localtime') FROM runs WHERE name = ?1",
+            [r],
+            |x| Ok((x.get(0)?, x.get(1)?, x.get(2)?, x.get(3)?, x.get(4)?)),
+        )?;
+        let live = col.iter().filter(|e| e.src == "live").count();
+        let mut f = vec![mode];
+        f.extend(parent.map(|p| format!("from {p}")));
+        f.push(when);
+        f.push(format!("{} steps ({live} live, {} replayed)", col.len(), col.len() - live));
+        f.extend(model.map(|m| format!("model swapped to {m}")));
+        f.extend(upstream);
+        facts += &format!("<div><dt>{}</dt><dd>{}</dd></div>", esc(r), esc(&f.join(" · ")));
+    }
+
+    let mut rows = String::new();
+    for i in 0..n {
+        let es: Vec<Option<&Ev>> = cols.iter().map(|col| col.get(i)).collect();
+        let (cls, body) = if same_at(i) {
+            let sources: Vec<String> = runs.iter().zip(&es).flat_map(|(r, e)| e.map(|e| format!("{} in {r}", src_label(e)))).collect();
+            ("same", cell(c, es[0].expect("same_at implies present"), "", &sources.join(", "), true)?)
+        } else {
+            let mut body = String::new();
+            for (r, e) in runs.iter().zip(&es) {
+                body += &match e {
+                    Some(e) => cell(c, e, r, src_label(e), false)?,
+                    None => format!(r#"<div class="cell"><p class="who">{}</p><p class="missing">No step {i} in this run.</p></div>"#, esc(r)),
+                };
+            }
+            if let [Some(x), Some(y)] = es.as_slice() {
+                body += &change(c, i, x, y, &runs[0], &runs[1], first_div.filter(|&d| d < i))?;
+            }
+            (if runs.len() == 1 { "solo" } else { "diverged" }, body)
+        };
+        let after = if first_div.is_some_and(|d| i >= d) { " after" } else { "" };
+        rows += &format!(r#"<section class="step {cls}{after}" id="step-{i}"><div class="gutter"><span class="n">{i}</span></div>{body}</section>"#);
+    }
+    if n == 0 {
+        rows = r#"<p class="missing">No steps to show.</p>"#.into();
+    }
+
+    let names: Vec<String> = runs.iter().map(|r| esc(r)).collect();
+    let colheads = if runs.len() > 1 {
+        format!(r#"<div class="colheads"><span></span>{}</div>"#, names.iter().map(|n| format!("<span>{n}</span>")).collect::<String>())
+    } else {
+        String::new()
+    };
+    let generated: String = c.query_row("SELECT strftime('%Y-%m-%d %H:%M', 'now', 'localtime')", [], |r| r.get(0))?;
+    Ok(format!(
+        r#"<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title} · Construct</title><style>{CSS}</style><body><div class="wrap" style="--grid:3rem repeat({k},minmax(0,1fr))"><header><p class="brand">AROK Construct</p><h1>{h1}</h1><p class="lede">{lede}</p><dl class="runs">{facts}</dl></header><main>{colheads}{rows}</main><footer>{db} &middot; Construct {ver} &middot; generated {generated}</footer></div><script>addEventListener('beforeprint',()=>document.querySelectorAll('details').forEach(d=>d.open=true))</script></body></html>"#,
+        title = names.join(" vs "),
+        k = runs.len(),
+        h1 = names.join(r#"<span class="vs">vs</span>"#),
+        db = esc(&db_path()),
+        ver = env!("CARGO_PKG_VERSION"),
     ))
 }
 
 fn cmd_view(c: &Connection, runs: &[String], out: &str) -> R<()> {
-    let cols = runs.iter().map(|r| timeline(c, r)).collect::<R<Vec<_>>>()?;
-    let names = runs.iter().map(|r| esc(r)).collect::<Vec<_>>();
-    let mut html = format!(
-        "<!doctype html><meta charset=utf-8><meta name=viewport content=\"width=device-width\">\
-         <title>Construct Timeline</title><style>{CSS}</style><body style=\"--cols:{}\">\
-         <h1>AROK Construct timeline</h1><div class=\"meta\">{} &middot; {}</div><div class=\"row\">{}</div>",
-        runs.len(),
-        names.join(" &harr; "),
-        esc(&db_path()),
-        names.iter().map(|n| format!(r#"<div class="colhead">{n}</div>"#)).collect::<String>()
-    );
-    for i in 0..cols.iter().map(Vec::len).max().unwrap_or(0) {
-        let es: Vec<Option<&Ev>> = cols.iter().map(|col| col.get(i)).collect();
-        let same = match es[0] {
-            Some(f) => es.iter().all(|e| e.is_some_and(|e| e.key == f.key && e.resp == f.resp)),
-            None => false,
-        };
-        let mut extra = String::new();
-        if let [Some(x), Some(y)] = es.as_slice() {
-            if !same && x.typ == "llm_call" && y.typ == "llm_call" {
-                let ((ta, _), (tb, _)) = (assistant_payload(&resp_obj(c, x)?), assistant_payload(&resp_obj(c, y)?));
-                if ta != tb {
-                    let d = word_diff(&ta, &tb, esc, ["<del>", "</del>"], ["<ins>", "</ins>"]);
-                    extra = format!(r#"<div class="diff">step {i}: {d}</div>"#);
-                }
-            }
-        }
-        let cells = es.iter().map(|e| card(c, *e)).collect::<R<String>>()?;
-        let cls = if es.len() == 1 || same { "row" } else { "row div" };
-        html += &format!(r#"<div class="{cls}">{cells}{extra}</div>"#);
-    }
-    std::fs::write(out, html)?;
+    std::fs::write(out, render_view(c, runs)?)?;
     println!("wrote {out}");
     Ok(())
 }
@@ -1021,6 +1229,70 @@ mod tests {
         let msg = &sse_join(body.as_bytes())["choices"][0]["message"];
         assert_eq!(msg["content"], "Hi there");
         assert_eq!(norm_tools(&msg["tool_calls"]), json!([{"name": "f", "args": {"a": 2}}]));
+    }
+
+    // viewer
+
+    fn base_and_fork(db: &str) -> Vec<String> {
+        let up = stub(echo);
+        let rec = proxy(db, "record", "base", Some(up), None, None);
+        chat(rec, json!([{"role": "user", "content": "hi"}]), "m1");
+        chat(rec, json!([{"role": "user", "content": "hi"}, {"role": "user", "content": "more"}]), "m1");
+        let frk = proxy(db, "fork", "b1", Some(up), Some("base"), Some("m2"));
+        chat(frk, json!([{"role": "user", "content": "hi"}]), "m1");
+        chat(frk, json!([{"role": "user", "content": "hi"}, {"role": "user", "content": "MUTATED"}]), "m1");
+        for (port, turn) in [(rec, "more"), (frk, "MUTATED")] {
+            chat(port, json!([{"role": "user", "content": "hi"}, {"role": "user", "content": turn}, {"role": "user", "content": "go"}]), "m1");
+        }
+        vec!["base".into(), "b1".into()]
+    }
+
+    #[test]
+    fn view_merges_identical_and_marks_divergence() {
+        let db = tmpdb();
+        let runs = base_and_fork(&db);
+        let html = render_view(&open(&db).unwrap(), &runs).unwrap();
+        assert!(html.contains(r#"<section class="step same" id="step-0">"#), "step 0 should merge");
+        assert!(html.contains(r#"<section class="step diverged after" id="step-1">"#), "step 1 should diverge");
+        assert!(html.contains("Identical through step 0; diverges at step 1."));
+        assert!(html.contains("live in base, replayed in b1"));
+        assert!(html.contains("What changed at step 1"));
+        assert!(html.contains("<del>model=m1</del> <ins>model=m2</ins>"), "response word diff");
+        assert!(html.contains("model swapped to m2"));
+        assert!(html.contains("carries the change from step 1"), "later request diffs fold");
+        let first = &html[html.find(r#"id="step-1""#).unwrap()..html.find(r#"id="step-2""#).unwrap()];
+        assert!(!first.contains("Show request diff"), "the first divergence shows its request diff open");
+    }
+
+    #[test]
+    fn view_is_self_contained_and_escaped() {
+        let db = tmpdb();
+        let rec = proxy(&db, "record", "base", Some(stub(echo)), None, None);
+        chat(rec, json!([{"role": "user", "content": "<script>alert(1)</script>"}]), "<b>m</b>");
+        let html = render_view(&open(&db).unwrap(), &["base".into()]).unwrap();
+        assert!(!html.contains("<script>alert") && !html.contains("<b>m</b>"), "user content must be escaped");
+        for external in ["<link", " src=", "@import", "url(", "@font-face"] {
+            assert!(!html.contains(external), "timeline must not load {external}");
+        }
+    }
+
+    #[test]
+    fn view_single_and_empty_runs() {
+        let db = tmpdb();
+        let rec = proxy(&db, "record", "base", Some(stub(echo)), None, None);
+        chat(rec, json!([{"role": "user", "content": "hi"}]), "m1");
+        proxy(&db, "record", "empty", Some(1), None, None);
+        let c = open(&db).unwrap();
+        assert!(render_view(&c, &["base".into()]).unwrap().contains("1 steps: 1 live, 0 replayed."));
+        assert!(render_view(&c, &["empty".into()]).unwrap().contains("This run recorded no steps."));
+        let both = render_view(&c, &["base".into(), "empty".into()]).unwrap();
+        assert!(both.contains("Diverges at the first step.") && both.contains("No step 0 in this run."));
+    }
+
+    #[test]
+    fn tool_line_reads_like_a_call() {
+        let tools = norm_tools(&json!([{"function": {"name": "search", "arguments": "{\"query\": \"volcanoes\", \"limit\": 3}"}}]));
+        assert_eq!(tool_line(&tools), r#"search(limit: 3, query: "volcanoes")"#);
     }
 
     // differ
