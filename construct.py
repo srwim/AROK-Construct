@@ -42,14 +42,17 @@ def _post(url, obj):
 
 
 def binary():
-    """Path to the construct binary: $CONSTRUCT_BIN, else this repo's cargo build."""
+    """Path to the construct binary: $CONSTRUCT_BIN, a cargo build, or a release
+    download saved next to this file."""
     here = Path(__file__).parent
     for p in (os.environ.get("CONSTRUCT_BIN"), here / "target/release/construct",
-              here / "target/debug/construct"):
+              here / "target/debug/construct", here / "construct", here / "construct-windows-x64",
+              here / "construct-linux-x64", here / "construct-macos-arm64"):
         for candidate in (p and Path(p), p and Path(f"{p}.exe")):
             if candidate and candidate.is_file():
                 return str(candidate)
-    raise FileNotFoundError("construct binary not found: run `cargo build` or set CONSTRUCT_BIN")
+    raise FileNotFoundError("construct binary not found: put the release download next to construct.py, "
+                            "run `cargo build`, or set CONSTRUCT_BIN")
 
 
 def serve(mode, run, upstream=None, parent=None, model=None, port=0):
