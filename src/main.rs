@@ -26,6 +26,8 @@ usage:
   construct diff   RUN_A RUN_B                              divergence report
   construct view   RUN [RUN...] [-o timeline.html]          HTML timeline
   construct runs                                            list recorded runs
+  construct search QUERY [--run RUN] [--limit 10]           full-text search over every step
+  construct eval   RUN --checks FILE [--baseline RUN]        score a run; exit 1 on failure/regression
   construct mcp                                             MCP server on stdio (read-only)
 
 env: CONSTRUCT_DB (default ./construct.db), CONSTRUCT_UPSTREAM (default for --upstream)";
@@ -125,23 +127,25 @@ fn timeline(c: &Connection, run: &str) -> R<Vec<Ev>> {
     if found.is_none() {
         return Err(format!("no such run '{run}' in {}", db_path()).into());
     }
-    let mut st = c.prepare(
-        "SELECT type, path, name, key, req, resp, status, src, ctype FROM events WHERE run = ?1 ORDER BY seq",
-    )?;
-    let rows = st.query_map([run], |r| {
-        Ok(Ev {
-            typ: r.get(0)?,
-            path: r.get(1)?,
-            name: r.get(2)?,
-            key: r.get(3)?,
-            req: r.get(4)?,
-            resp: r.get(5)?,
-            status: r.get(6)?,
-            src: r.get(7)?,
-            ctype: r.get(8)?,
-        })
-    })?;
+    let mut st = c.prepare(&format!("SELECT {EV_COLS} FROM events WHERE run = ?1 ORDER BY seq"))?;
+    let rows = st.query_map([run], |r| ev_at(r, 0))?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+const EV_COLS: &str = "type, path, name, key, req, resp, status, src, ctype";
+
+fn ev_at(r: &rusqlite::Row, i: usize) -> rusqlite::Result<Ev> {
+    Ok(Ev {
+        typ: r.get(i)?,
+        path: r.get(i + 1)?,
+        name: r.get(i + 2)?,
+        key: r.get(i + 3)?,
+        req: r.get(i + 4)?,
+        resp: r.get(i + 5)?,
+        status: r.get(i + 6)?,
+        src: r.get(i + 7)?,
+        ctype: r.get(i + 8)?,
+    })
 }
 
 // ---------- proxy ----------
@@ -900,6 +904,288 @@ fn cmd_runs(c: &Connection) -> R<()> {
     Ok(())
 }
 
+// ---------- search: full-text retrieval over every step (SQLite FTS5, BM25 ranking) ----------
+
+/// Every string leaf of a JSON value, skipping structural keys.
+fn strings(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(a) => a.iter().for_each(|x| strings(x, out)),
+        Value::Object(m) => m
+            .iter()
+            .filter(|(k, _)| !matches!(k.as_str(), "type" | "role" | "id" | "tool_use_id" | "tool_call_id" | "model"))
+            .for_each(|(_, x)| strings(x, out)),
+        _ => {}
+    }
+}
+
+/// What a step is about: its newest input message and what came back (or an effect's args and result).
+fn step_text(c: &Connection, e: &Ev) -> R<String> {
+    let (req, resp) = (jget(c, &e.req)?, resp_obj(c, e)?);
+    let mut out = vec![e.label().to_string()];
+    if e.typ == "effect" {
+        strings(&req, &mut out);
+        strings(&resp, &mut out);
+    } else {
+        if let Some(last) = req["messages"].as_array().and_then(|m| m.last()) {
+            strings(last, &mut out);
+        }
+        let (text, tools) = assistant_payload(&resp);
+        out.extend([text, tool_line(&tools)]);
+    }
+    Ok(out.join("\n"))
+}
+
+/// Bring the per-connection index up to date. It lives in the temp schema, so it works on the
+/// read-only MCP connection and never touches the evidence file; events are append-only, so
+/// rowid order is a complete change feed.
+// ponytail: rebuilt per connection (one pass over the log); persist it in the db if logs reach millions of steps
+fn index(c: &Connection) -> R<()> {
+    c.execute_batch(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS temp.fts USING fts5(run UNINDEXED, step UNINDEXED, kind UNINDEXED, label UNINDEXED, body, tokenize = 'porter unicode61')",
+    )?;
+    let last: i64 = c.query_row("SELECT coalesce(max(rowid), 0) FROM temp.fts", [], |r| r.get(0))?;
+    let mut st = c.prepare(&format!("SELECT rowid, run, seq, {EV_COLS} FROM events WHERE rowid > ?1 ORDER BY rowid"))?;
+    let new = st
+        .query_map([last], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, ev_at(r, 3)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    for (rowid, run, seq, e) in new {
+        c.execute(
+            "INSERT INTO temp.fts (rowid, run, step, kind, label, body) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![rowid, run, seq, e.typ, e.label(), step_text(c, &e)?],
+        )?;
+    }
+    Ok(())
+}
+
+/// Ranked steps matching every word of `query` (each word quoted, so FTS operators in user text are literal).
+fn search(c: &Connection, query: &str, run: Option<&str>, limit: i64) -> R<Value> {
+    let q: Vec<String> = query.split_whitespace().map(|t| format!("\"{}\"", t.replace('"', "\"\""))).collect();
+    if q.is_empty() {
+        return Err("query is empty".into());
+    }
+    index(c)?;
+    let mut st = c.prepare(
+        "SELECT run, step, kind, label, snippet(fts, 4, '[', ']', '…', 16), round(-bm25(fts), 3) FROM temp.fts
+         WHERE fts MATCH ?1 AND (?2 IS NULL OR run = ?2) ORDER BY bm25(fts) LIMIT ?3",
+    )?;
+    let hits = st
+        .query_map(params![q.join(" "), run, limit.clamp(1, 100)], |r| {
+            Ok(json!({
+                "run": r.get::<_, String>(0)?, "step": r.get::<_, i64>(1)?, "type": r.get::<_, String>(2)?,
+                "label": r.get::<_, String>(3)?, "snippet": r.get::<_, String>(4)?, "score": r.get::<_, f64>(5)?,
+            }))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(json!({ "query": query, "hits": hits }))
+}
+
+fn cmd_search(c: &Connection, query: &str, run: Option<&str>, limit: i64) -> R<()> {
+    let hits = search(c, query, run, limit)?;
+    let hits = hits["hits"].as_array().expect("search returns hits");
+    if hits.is_empty() {
+        println!("no steps match '{query}'");
+    }
+    for h in hits {
+        let (run, label, snip) = (h["run"].as_str().unwrap_or(""), h["label"].as_str().unwrap_or(""), h["snippet"].as_str().unwrap_or(""));
+        println!("{run} step {}  {label}  ({})\n    {}", h["step"], h["score"], snip.replace('\n', " "));
+    }
+    Ok(())
+}
+
+// ---------- eval: score a run against checks; with a baseline, report regressions ----------
+
+fn type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(n) if n.is_f64() => "number",
+        Value::Number(_) => "integer",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
+}
+
+/// A JSON Schema subset. An unsupported keyword is an error, never a silent pass.
+fn validate(v: &Value, schema: &Value, at: &str, errs: &mut Vec<String>) -> R<()> {
+    let Some(s) = schema.as_object() else { return Err(format!("schema at {at} is not an object").into()) };
+    let num = |k: &str| s[k].as_f64().ok_or_else(|| Box::<dyn Error>::from(format!("{at}: '{k}' must be a number")));
+    for (k, want) in s {
+        match k.as_str() {
+            "type" => {
+                let types: Vec<&str> = match want {
+                    Value::String(t) => vec![t.as_str()],
+                    Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+                    _ => return Err(format!("{at}: 'type' must be a string or list").into()),
+                };
+                let got = type_name(v);
+                let integral = v.as_f64().is_some_and(|f| f.fract() == 0.0);
+                if !types.iter().any(|t| *t == got || (*t == "number" && got == "integer") || (*t == "integer" && integral)) {
+                    errs.push(format!("{at}: expected {}, got {got}", types.join(" or ")));
+                }
+            }
+            "enum" if !want.as_array().is_some_and(|a| a.contains(v)) => errs.push(format!("{at}: {v} is not one of {want}")),
+            "const" if v != want => errs.push(format!("{at}: expected {want}, got {v}")),
+            "required" => {
+                for r in want.as_array().into_iter().flatten().filter_map(Value::as_str) {
+                    if v.as_object().is_some_and(|o| !o.contains_key(r)) {
+                        errs.push(format!("{at}: missing required '{r}'"));
+                    }
+                }
+            }
+            "properties" => {
+                let props = want.as_object().ok_or_else(|| format!("{at}: 'properties' must be an object"))?;
+                for (p, ps) in props {
+                    if let Some(x) = v.get(p).filter(|_| v.is_object()) {
+                        validate(x, ps, &format!("{at}.{p}"), errs)?;
+                    }
+                }
+            }
+            "additionalProperties" => match (want, v.as_object()) {
+                (Value::Bool(true), _) | (Value::Bool(false), None) => {}
+                (Value::Bool(false), Some(o)) => {
+                    for key in o.keys().filter(|key| !s.get("properties").is_some_and(|p| p.get(key.as_str()).is_some())) {
+                        errs.push(format!("{at}: unexpected property '{key}'"));
+                    }
+                }
+                _ => return Err(format!("{at}: only true/false 'additionalProperties' is supported").into()),
+            },
+            "items" => {
+                for (i, x) in v.as_array().into_iter().flatten().enumerate() {
+                    validate(x, want, &format!("{at}[{i}]"), errs)?;
+                }
+            }
+            "minimum" | "maximum" => {
+                let (b, low) = (num(k)?, k == "minimum");
+                if let Some(x) = v.as_f64().filter(|x| if low { *x < b } else { *x > b }) {
+                    errs.push(format!("{at}: {x} is {} {b}", if low { "below" } else { "above" }));
+                }
+            }
+            "minLength" | "maxLength" | "minItems" | "maxItems" => {
+                let (b, low) = (num(k)? as usize, k.starts_with("min"));
+                let n = v.as_str().map(|x| x.chars().count()).or(v.as_array().map(Vec::len)).filter(|_| k.ends_with("Length") == v.is_string());
+                if let Some(n) = n.filter(|n| if low { *n < b } else { *n > b }) {
+                    errs.push(format!("{at}: length {n} is {} {b}", if low { "below" } else { "above" }));
+                }
+            }
+            "enum" | "const" | "title" | "description" | "$schema" | "default" | "examples" => {}
+            other => return Err(format!("{at}: schema keyword '{other}' is not supported").into()),
+        }
+    }
+    Ok(())
+}
+
+/// Models often fence JSON output in ```json ... ```.
+fn unfence(s: &str) -> &str {
+    let t = s.trim();
+    match (t.strip_prefix("```"), t.strip_suffix("```")) {
+        (Some(_), Some(_)) if t.len() > 6 => t[3..t.len() - 3].split_once('\n').map_or("", |(_, body)| body).trim(),
+        _ => t,
+    }
+}
+
+/// (passed, detail) for one check against one run.
+fn check(c: &Connection, tl: &[Ev], ck: &Value) -> R<(bool, String)> {
+    let llm: Vec<(usize, &Ev)> = tl.iter().enumerate().filter(|(_, e)| e.typ == "llm_call").collect();
+    if let Some(tool) = ck["tool"].as_str() {
+        let schema = ck.get("schema").ok_or("a tool check needs 'schema'")?;
+        let (mut calls, mut errs) = (0, Vec::new());
+        for (i, e) in &llm {
+            for t in assistant_payload(&resp_obj(c, e)?).1.as_array().into_iter().flatten().filter(|t| t["name"] == tool) {
+                calls += 1;
+                validate(&t["args"], schema, &format!("step {i} {tool}"), &mut errs)?;
+            }
+        }
+        return Ok(match (calls, errs.is_empty()) {
+            (0, _) => (false, format!("{tool} was never called")),
+            (n, true) => (true, format!("{n} call(s) to {tool} match the schema")),
+            (_, false) => (false, errs.join("; ")),
+        });
+    }
+    let text_at = |e: &Ev| resp_obj(c, e).map(|r| assistant_payload(&r).0);
+    let target = match &ck["step"] {
+        Value::Null => text_at(llm.last().ok_or("run has no LLM calls")?.1)?,
+        Value::String(w) if w == "last" => text_at(llm.last().ok_or("run has no LLM calls")?.1)?,
+        Value::String(w) if w == "any" => llm.iter().map(|(_, e)| text_at(e)).collect::<R<Vec<_>>>()?.join("\n"),
+        Value::Number(n) => {
+            let i = n.as_u64().ok_or("'step' must be a step number, \"last\" or \"any\"")? as usize;
+            text_at(llm.iter().find(|(j, _)| *j == i).ok_or(format!("step {i} is not an LLM call"))?.1)?
+        }
+        _ => return Err("'step' must be a step number, \"last\" or \"any\"".into()),
+    };
+    let words = |k: &str| ck[k].as_array().into_iter().flatten().filter_map(Value::as_str).collect::<Vec<_>>();
+    let (inc, exc, schema) = (words("includes"), words("excludes"), ck.get("schema"));
+    if inc.is_empty() && exc.is_empty() && schema.is_none() {
+        return Err("a check needs 'includes', 'excludes', 'schema', or 'tool' + 'schema'".into());
+    }
+    let low = target.to_lowercase();
+    let mut errs: Vec<String> = inc.iter().filter(|w| !low.contains(&w.to_lowercase())).map(|w| format!("missing \"{w}\"")).collect();
+    errs.extend(exc.iter().filter(|w| low.contains(&w.to_lowercase())).map(|w| format!("contains \"{w}\"")));
+    if let Some(schema) = schema {
+        match serde_json::from_str::<Value>(unfence(&target)) {
+            Ok(v) => validate(&v, schema, "output", &mut errs)?,
+            Err(e) => errs.push(format!("output is not JSON ({e})")),
+        }
+    }
+    Ok((errs.is_empty(), if errs.is_empty() { "ok".into() } else { errs.join("; ") }))
+}
+
+fn eval_json(c: &Connection, run: &str, checks: &Value, baseline: Option<&str>) -> R<Value> {
+    let list = checks.get("checks").unwrap_or(checks).as_array().ok_or("checks must be a list or {\"checks\": [...]}")?;
+    if list.is_empty() {
+        return Err("no checks to run".into());
+    }
+    let tl = timeline(c, run)?;
+    let bl = baseline.map(|b| timeline(c, b)).transpose()?;
+    let (mut results, mut regressions, mut fixes, mut passed) = (Vec::new(), Vec::new(), Vec::new(), 0);
+    for (i, ck) in list.iter().enumerate() {
+        let name = ck["name"].as_str().map_or_else(|| format!("check {i}"), str::to_string);
+        let run_one = |t: &[Ev]| check(c, t, ck).map_err(|e| Box::<dyn Error>::from(format!("{name}: {e}")));
+        let (pass, detail) = run_one(&tl)?;
+        passed += usize::from(pass);
+        let mut row = json!({ "name": name, "pass": pass, "detail": detail });
+        if let Some(b) = &bl {
+            let (bp, bd) = run_one(b)?;
+            if bp && !pass {
+                regressions.push(name.clone());
+            } else if pass && !bp {
+                fixes.push(name.clone());
+            }
+            row["baseline_pass"] = json!(bp);
+            row["baseline_detail"] = json!(bd);
+        }
+        results.push(row);
+    }
+    Ok(json!({
+        "run": run, "baseline": baseline, "passed": passed, "total": list.len(),
+        "regressions": regressions, "fixes": fixes, "results": results,
+    }))
+}
+
+/// Exit status is the gate: any failure (or, with a baseline, any regression) is an error.
+fn cmd_eval(c: &Connection, run: &str, checks_file: &str, baseline: Option<&str>) -> R<()> {
+    let checks: Value = serde_json::from_str(&std::fs::read_to_string(checks_file)?).map_err(|e| format!("{checks_file}: {e}"))?;
+    let r = eval_json(c, run, &checks, baseline)?;
+    println!("eval {run} against {checks_file}{}", baseline.map(|b| format!(" (baseline {b})")).unwrap_or_default());
+    for row in r["results"].as_array().into_iter().flatten() {
+        let mark = if row["pass"] == true { "PASS" } else { "FAIL" };
+        let was = match row.get("baseline_pass") {
+            Some(Value::Bool(true)) if row["pass"] == false => "  (regression: passed in baseline)",
+            Some(Value::Bool(false)) if row["pass"] == true => "  (fixed: failed in baseline)",
+            _ => "",
+        };
+        println!("{mark}  {}: {}{was}", row["name"].as_str().unwrap_or(""), row["detail"].as_str().unwrap_or(""));
+    }
+    let (passed, total, regr) = (r["passed"].as_u64().unwrap_or(0), r["total"].as_u64().unwrap_or(0), r["regressions"].as_array().map_or(0, Vec::len));
+    println!("{passed}/{total} passed{}", if baseline.is_some() { format!("; {regr} regression(s)") } else { String::new() });
+    match baseline {
+        Some(_) if regr > 0 => Err(format!("{regr} regression(s) against baseline").into()),
+        None if passed < total => Err(format!("{} of {total} checks failed", total - passed).into()),
+        _ => Ok(()),
+    }
+}
+
 // ---------- MCP server: read-only access to the log for any MCP client (stdio, JSON-RPC 2.0) ----------
 
 const MCP_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
@@ -915,6 +1201,7 @@ fn open_ro(path: &str) -> R<Connection> {
 fn mcp_tools() -> Value {
     let s = |d: &str| json!({ "type": "string", "description": d });
     let run = s("Run name, as listed by list_runs.");
+    let run_desc = run.clone();
     let nullable = |t: &str| json!({ "type": [t, "null"] });
     let ro = json!({ "readOnlyHint": true, "idempotentHint": true, "openWorldHint": false });
     json!([
@@ -977,6 +1264,56 @@ fn mcp_tools() -> Value {
             },
             "annotations": ro,
         },
+        {
+            "name": "search_runs",
+            "title": "Search every step",
+            "description": "Full-text search (BM25-ranked) across every recorded step: the newest input message, \
+                            the assistant text and tool calls, and effect arguments and results. Every word must match.",
+            "inputSchema": {
+                "type": "object", "required": ["query"], "additionalProperties": false,
+                "properties": {
+                    "query": s("Words to find, e.g. 'refund policy'."),
+                    "run": s("Only search this run."),
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 100, "description": "Most hits to return (default 10)." },
+                },
+            },
+            "outputSchema": { "type": "object", "required": ["query", "hits"], "properties": {
+                "query": { "type": "string" },
+                "hits": { "type": "array", "items": { "type": "object",
+                    "required": ["run", "step", "type", "label", "snippet", "score"],
+                    "properties": {
+                        "run": { "type": "string" }, "step": { "type": "integer" }, "type": { "type": "string" },
+                        "label": { "type": "string" }, "snippet": { "type": "string" }, "score": { "type": "number" },
+                    } } },
+            } },
+            "annotations": ro,
+        },
+        {
+            "name": "eval_run",
+            "title": "Evaluate a run",
+            "description": "Score a run against checks; with a baseline run, report regressions and fixes. A check is \
+                            {name, step?: \"last\"|\"any\"|N, includes?: [..], excludes?: [..], schema?: JSON Schema for the \
+                            output} or {name, tool, schema} to validate every call to that tool's arguments.",
+            "inputSchema": {
+                "type": "object", "required": ["run", "checks"], "additionalProperties": false,
+                "properties": {
+                    "run": run_desc.clone(),
+                    "baseline": s("Optional run to compare against, e.g. the parent of a fork."),
+                    "checks": { "type": "array", "minItems": 1, "items": { "type": "object" } },
+                },
+            },
+            "outputSchema": {
+                "type": "object", "required": ["run", "baseline", "passed", "total", "regressions", "fixes", "results"],
+                "properties": {
+                    "run": { "type": "string" }, "baseline": nullable("string"),
+                    "passed": { "type": "integer" }, "total": { "type": "integer" },
+                    "regressions": { "type": "array", "items": { "type": "string" } },
+                    "fixes": { "type": "array", "items": { "type": "string" } },
+                    "results": { "type": "array", "items": { "type": "object", "required": ["name", "pass", "detail"] } },
+                },
+            },
+            "annotations": ro,
+        },
     ])
 }
 
@@ -1004,6 +1341,8 @@ fn mcp_call(c: &Connection, name: &str, a: &Value) -> Option<R<Value>> {
             let (report, first, na, nb) = diff_report(c, ra, rb)?;
             Ok(json!({ "run_a": ra, "run_b": rb, "steps_a": na, "steps_b": nb, "first_divergence": first, "report": report }))
         })(),
+        "search_runs" => (|| search(c, s("query")?, a["run"].as_str(), a["limit"].as_i64().unwrap_or(10)))(),
+        "eval_run" => (|| eval_json(c, s("run")?, &a["checks"], a["baseline"].as_str()))(),
         _ => return None,
     })
 }
@@ -1084,6 +1423,8 @@ fn cli(args: &[String]) -> R<()> {
         "fork" => &["--run", "--from", "--upstream", "--model", "--port"],
         "view" => &["-o", "--out"],
         "diff" | "runs" | "mcp" => &[],
+        "search" => &["--run", "--limit"],
+        "eval" => &["--checks", "--baseline"],
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             return Ok(());
@@ -1105,6 +1446,17 @@ fn cli(args: &[String]) -> R<()> {
         }
         "runs" => cmd_runs(&open(&db_path())?),
         "mcp" => cmd_mcp(&open_ro(&db_path())?),
+        "search" if pos.is_empty() => Err("usage: construct search QUERY [--run RUN] [--limit 10]".into()),
+        "search" => {
+            let limit = flags.get("--limit").map(|l| l.parse::<i64>()).transpose()?.unwrap_or(10);
+            cmd_search(&open_ro(&db_path())?, &pos.join(" "), flags.get("--run").map(String::as_str), limit)
+        }
+        "eval" => {
+            let ([run], Some(checks)) = (pos.as_slice(), flags.get("--checks")) else {
+                return Err("usage: construct eval RUN --checks FILE [--baseline RUN]".into());
+            };
+            cmd_eval(&open_ro(&db_path())?, run, checks, flags.get("--baseline").map(String::as_str))
+        }
         mode => {
             if !pos.is_empty() {
                 return Err(format!("{mode}: unexpected argument '{}'", pos[0]).into());
@@ -1540,7 +1892,7 @@ mod tests {
         let c = open(&tmpdb()).unwrap();
         let tools = rpc(&c, "tools/list", json!({}))["result"]["tools"].clone();
         let names: Vec<&str> = tools.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["list_runs", "get_step", "diff_runs"]);
+        assert_eq!(names, ["list_runs", "get_step", "diff_runs", "search_runs", "eval_run"]);
         for t in tools.as_array().unwrap() {
             assert_eq!(t["annotations"]["readOnlyHint"], true);
             assert_eq!(t["inputSchema"]["type"], "object");
@@ -1607,5 +1959,162 @@ mod tests {
         base_and_fork(&db);
         assert!(open_ro(&db).unwrap().execute("INSERT INTO objects (hash, data) VALUES ('x', x'00')", []).is_err());
         assert!(open_ro(&tmpdb()).is_err(), "a missing database is an error, not a new empty file");
+    }
+
+    // search
+
+    fn hits(v: &Value) -> Vec<(String, i64)> {
+        v["hits"].as_array().unwrap().iter().map(|h| (h["run"].as_str().unwrap().into(), h["step"].as_i64().unwrap())).collect()
+    }
+
+    #[test]
+    fn search_finds_steps_ranks_and_filters() {
+        let db = tmpdb();
+        base_and_fork(&db);
+        let c = open_ro(&db).unwrap();
+        assert_eq!(hits(&search(&c, "MUTATED", None, 10).unwrap()), [("b1".to_string(), 1)], "newest input message is indexed");
+        let r = search(&c, "model=m2", None, 10).unwrap();
+        assert!(hits(&r).iter().all(|(run, _)| run == "b1"), "response text is indexed: {r}");
+        assert!(r["hits"][0]["snippet"].as_str().unwrap().contains("[model=m2]"), "snippet marks the matched phrase: {r}");
+        assert_eq!(hits(&search(&c, "reply", Some("base"), 10).unwrap()).len(), 3, "run filter");
+        assert_eq!(hits(&search(&c, "reply", None, 2).unwrap()).len(), 2, "limit");
+        assert!(hits(&search(&c, "volcano", None, 10).unwrap()).is_empty());
+        assert!(search(&c, "   ", None, 10).is_err());
+        for q in [r#"a"b"#, "NOT -x OR", "col:val", "(", "*"] {
+            assert!(search(&c, q, None, 10).is_ok(), "FTS syntax in user text is literal: {q}");
+        }
+    }
+
+    #[test]
+    fn search_index_catches_up_on_a_live_connection() {
+        let db = tmpdb();
+        let up = stub(echo);
+        let rec = proxy(&db, "record", "base", Some(up), None, None);
+        chat(rec, json!([{"role": "user", "content": "first question"}]), "m1");
+        let c = open_ro(&db).unwrap();
+        assert_eq!(hits(&search(&c, "question", None, 10).unwrap()).len(), 1);
+        chat(rec, json!([{"role": "user", "content": "second question"}]), "m1");
+        assert_eq!(hits(&search(&c, "question", None, 10).unwrap()).len(), 2, "new events are indexed incrementally");
+    }
+
+    #[test]
+    fn search_indexes_tool_calls_and_effects() {
+        let db = tmpdb();
+        let rec = proxy(&db, "record", "base", Some(stub(sse)), None, None);
+        post(rec, "/v1/chat/completions", &json!({ "model": "m", "stream": true, "messages": [] }));
+        effect_call(rec, 0, &mut || json!({ "forecast": "sunny" })).unwrap();
+        let c = open_ro(&db).unwrap();
+        assert_eq!(hits(&search(&c, "f", None, 10).unwrap()), [("base".to_string(), 0)], "tool call names");
+        assert_eq!(hits(&search(&c, "sunny", None, 10).unwrap()), [("base".to_string(), 1)], "effect results");
+    }
+
+    // eval
+
+    fn errs_for(v: Value, schema: Value) -> Vec<String> {
+        let mut errs = Vec::new();
+        validate(&v, &schema, "x", &mut errs).unwrap();
+        errs
+    }
+
+    #[test]
+    fn validate_covers_the_common_subset() {
+        let schema = json!({
+            "type": "object", "required": ["id", "tags"], "additionalProperties": false,
+            "properties": {
+                "id": { "type": "integer", "minimum": 1 },
+                "tags": { "type": "array", "maxItems": 2, "items": { "type": "string", "enum": ["a", "b"] } },
+                "note": { "type": ["string", "null"], "maxLength": 3 },
+            },
+        });
+        assert!(errs_for(json!({ "id": 2, "tags": ["a"], "note": null }), schema.clone()).is_empty());
+        assert!(errs_for(json!({ "id": 2.0, "tags": [] }), schema.clone()).is_empty(), "2.0 is an integer");
+        let e = errs_for(json!({ "id": 0, "tags": ["a", "c", "b"], "note": "long", "extra": 1 }), schema.clone());
+        for want in ["x.id: 0 is below 1", "x.tags: length 3 is above 2", "x.tags[1]: \"c\" is not one of", "x.note: length 4", "unexpected property 'extra'"] {
+            assert!(e.iter().any(|m| m.contains(want)), "{want} in {e:?}");
+        }
+        assert!(errs_for(json!({ "tags": [] }), schema.clone()).iter().any(|m| m.contains("missing required 'id'")));
+        assert!(errs_for(json!("s"), schema).iter().any(|m| m == "x: expected object, got string"));
+        let mut errs = Vec::new();
+        assert!(validate(&json!("s"), &json!({ "pattern": "^a" }), "x", &mut errs).is_err(), "unsupported keywords never silently pass");
+    }
+
+    #[test]
+    fn unfence_strips_markdown_code_fences() {
+        assert_eq!(unfence("```json\n{\"a\": 1}\n```"), "{\"a\": 1}");
+        assert_eq!(unfence("  {\"a\": 1} "), "{\"a\": 1}");
+        assert_eq!(unfence("```"), "```");
+    }
+
+    #[test]
+    fn eval_text_checks_and_baseline_regressions() {
+        let db = tmpdb();
+        base_and_fork(&db);
+        let c = open_ro(&db).unwrap();
+        let checks = json!({ "checks": [
+            { "name": "names the model", "includes": ["MODEL=M1"] },
+            { "name": "replies", "step": "any", "includes": ["reply-1", "reply-3"] },
+            { "name": "no apology", "excludes": ["sorry"] },
+            { "name": "step 0", "step": 0, "includes": ["reply-1"] },
+        ] });
+        let base = eval_json(&c, "base", &checks, None).unwrap();
+        assert_eq!((base["passed"].as_u64(), base["total"].as_u64()), (Some(4), Some(4)), "{base}");
+        let fork = eval_json(&c, "b1", &checks, Some("base")).unwrap();
+        assert_eq!(fork["regressions"], json!(["names the model"]), "{fork}");
+        assert_eq!(fork["results"][0]["detail"], "missing \"MODEL=M1\"");
+        assert_eq!(fork["results"][0]["baseline_pass"], true);
+        let fixed = eval_json(&c, "base", &json!([{ "name": "m2", "includes": ["m2"] }]), Some("b1")).unwrap();
+        assert_eq!(fixed["regressions"], json!(["m2"]));
+        let fixed = eval_json(&c, "b1", &json!([{ "name": "m2", "includes": ["m2"] }]), Some("base")).unwrap();
+        assert_eq!(fixed["fixes"], json!(["m2"]));
+    }
+
+    #[test]
+    fn eval_tool_and_output_schemas() {
+        let db = tmpdb();
+        let rec = proxy(&db, "record", "base", Some(stub(sse)), None, None);
+        post(rec, "/v1/chat/completions", &json!({ "model": "m", "stream": true, "messages": [] }));
+        let c = open_ro(&db).unwrap();
+        let int_a = json!({ "type": "object", "required": ["a"], "properties": { "a": { "type": "integer" } } });
+        let r = eval_json(&c, "base", &json!([
+            { "name": "f args", "tool": "f", "schema": int_a },
+            { "name": "f args strict", "tool": "f", "schema": { "type": "object", "properties": { "a": { "type": "string" } } } },
+            { "name": "g called", "tool": "g", "schema": {} },
+            { "name": "json out", "schema": { "type": "object" } },
+        ]), None).unwrap();
+        let pass: Vec<bool> = r["results"].as_array().unwrap().iter().map(|x| x["pass"] == true).collect();
+        assert_eq!(pass, [true, false, false, false], "{r}");
+        assert_eq!(r["results"][2]["detail"], "g was never called");
+        assert!(r["results"][3]["detail"].as_str().unwrap().starts_with("output is not JSON"));
+    }
+
+    #[test]
+    fn eval_rejects_malformed_checks() {
+        let db = tmpdb();
+        base_and_fork(&db);
+        let c = open_ro(&db).unwrap();
+        for (checks, says) in [
+            (json!([]), "no checks"),
+            (json!([{ "name": "empty" }]), "empty: a check needs"),
+            (json!([{ "includes": ["x"], "step": 9 }]), "check 0: step 9 is not an LLM call"),
+            (json!([{ "includes": ["x"], "step": "first" }]), "'step' must be"),
+            (json!({ "nope": 1 }), "checks must be"),
+        ] {
+            let e = eval_json(&c, "base", &checks, None).unwrap_err().to_string();
+            assert!(e.contains(says), "{says}: {e}");
+        }
+    }
+
+    #[test]
+    fn mcp_search_and_eval_tools() {
+        let db = tmpdb();
+        base_and_fork(&db);
+        let c = open_ro(&db).unwrap();
+        let r = call(&c, "search_runs", json!({ "query": "MUTATED" }));
+        assert_matches_schema("search_runs", &r["structuredContent"]);
+        assert_eq!(r["structuredContent"]["hits"][0]["run"], "b1");
+        let r = call(&c, "eval_run", json!({ "run": "b1", "baseline": "base", "checks": [{ "name": "m1", "includes": ["m1"] }] }));
+        assert_matches_schema("eval_run", &r["structuredContent"]);
+        assert_eq!(r["structuredContent"]["regressions"], json!(["m1"]));
+        assert_eq!(call(&c, "eval_run", json!({ "run": "b1", "checks": [{}] }))["isError"], true);
     }
 }

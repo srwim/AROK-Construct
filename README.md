@@ -41,6 +41,8 @@ construct fork   --run b1 --from base --upstream ... --model gpt-x
 construct diff   base b1                               # divergence report
 construct view   base b1 -o timeline.html              # visual timeline
 construct runs                                         # list recorded runs
+construct search refund policy --run b1               # full-text search over every step
+construct eval   b1 --checks checks.json --baseline base  # score; exit 1 on regression
 construct mcp                                          # MCP server on stdio (read-only)
 ```
 
@@ -71,6 +73,8 @@ an agent can investigate the evidence but never alter it.
 | `list_runs` | every run: mode, parent, substituted model, live vs replayed steps |
 | `get_step` | one step's exact request and response, assistant text, tool calls |
 | `diff_runs` | first divergence between two runs and the full divergence report |
+| `search_runs` | BM25-ranked full-text hits across every step, with highlighted snippets |
+| `eval_run` | pass/fail per check; with a baseline, regressions and fixes |
 
 Each tool declares an `outputSchema` and returns typed `structuredContent`
 alongside readable text. Failures (unknown run, step out of range) come back
@@ -89,6 +93,51 @@ Claude Desktop (`claude_desktop_config.json`):
 ```
 
 Then ask: "Where did run b1 diverge from base, and what did the model do differently?"
+
+## Retrieval
+
+`construct search` (and the `search_runs` tool) ranks every recorded step with
+SQLite FTS5 and BM25: the newest input message, the assistant's text and tool
+calls, and effect arguments and results, with English stemming. The index is
+built in SQLite's temp schema and caught up incrementally from the append-only
+log, so it works on the read-only MCP connection and never writes to the
+evidence file. Every word of the query must match; FTS operators in user text
+are treated literally.
+
+## Evals
+
+A checks file states what a good run looks like:
+
+```json
+{ "checks": [
+  { "name": "cites the policy", "includes": ["refund", "30 days"] },
+  { "name": "never promises", "step": "any", "excludes": ["guarantee"] },
+  { "name": "answer is structured", "schema": {
+      "type": "object", "required": ["decision", "reason"],
+      "properties": { "decision": { "enum": ["approve", "deny"] } } } },
+  { "name": "lookup args valid", "tool": "lookup_order", "schema": {
+      "type": "object", "required": ["order_id"], "additionalProperties": false,
+      "properties": { "order_id": { "type": "string", "minLength": 6 } } } }
+] }
+```
+
+Text checks read the last LLM call by default (`"step": "any"` reads them all,
+a number reads one). `schema` validates the output as JSON (markdown fences
+are stripped); `tool` + `schema` validates the arguments of every call to that
+tool, and fails if the tool was never called. The validator covers the common
+JSON Schema subset (`type`, `enum`, `const`, `required`, `properties`,
+`additionalProperties: false`, `items`, min/max bounds and lengths); any other
+keyword is an error, never a silent pass.
+
+`construct eval` exits 1 when a check fails. With `--baseline`, it exits 1
+only on regressions (passed in the baseline, fails now) and reports fixes, so
+record a baseline, `fork` it with a new prompt or model, and gate the change
+in CI:
+
+```sh
+construct fork --run candidate --from base --upstream https://api.openai.com --model gpt-x
+construct eval candidate --checks checks.json --baseline base
+```
 
 ## How it works
 
