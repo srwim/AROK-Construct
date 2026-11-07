@@ -8,12 +8,37 @@ an append-only event log the database itself refuses to rewrite. Replay a run
 fully offline, fork it at any step with a mutated prompt, substitute the model
 from the fork point forward, and diff the two timelines.
 
-Works with anything that speaks OpenAI/Anthropic-compatible HTTP (LangChain,
-CrewAI, raw SDKs):
+Agent- and provider-agnostic: works with anything that speaks OpenAI-,
+Anthropic- or Ollama-compatible HTTP (LangChain, CrewAI, raw SDKs), against
+cloud APIs or local models:
 
 ```sh
 OPENAI_BASE_URL=http://127.0.0.1:8787/v1
 ```
+
+## Local LLMs
+
+Construct has no provider built in: `--upstream` is any URL, so agents running
+against local models are recorded the same way as cloud ones, and replay is
+fully offline either way.
+
+```sh
+# Ollama: native API (/api/chat, /api/generate) or its OpenAI-compatible /v1
+construct record --run local --upstream http://127.0.0.1:11434
+# then point the agent's Ollama base URL at http://127.0.0.1:8787
+
+# llama.cpp server, vLLM, LM Studio: OpenAI-compatible
+construct record --run local --upstream http://127.0.0.1:8080
+OPENAI_BASE_URL=http://127.0.0.1:8787/v1
+
+# compare two local models on the same run
+construct fork --run qwen --from local --upstream http://127.0.0.1:11434 --model qwen2.5
+construct diff local qwen
+```
+
+Responses are read in OpenAI, Anthropic and Ollama native shapes, streamed
+(SSE or Ollama's line-delimited JSON) or not, so search, diff, the timeline
+and evals see the model's text and tool calls rather than raw JSON.
 
 ## Build and try it
 

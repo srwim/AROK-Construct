@@ -424,9 +424,28 @@ fn sse_join(body: &[u8]) -> Value {
             }
         }
     }
+    joined(text, tools.into_values().collect(), model)
+}
+
+/// Reassemble an Ollama native stream (`/api/chat` or `/api/generate`, one JSON object per line).
+fn ndjson_join(body: &[u8]) -> Value {
+    let (mut text, mut tools, mut model) = (String::new(), Vec::new(), Value::Null);
+    for line in String::from_utf8_lossy(body).lines() {
+        let Ok(ev) = serde_json::from_str::<Value>(line.trim()) else { continue };
+        if !ev["model"].is_null() {
+            model = ev["model"].clone();
+        }
+        text.push_str(ev["message"]["content"].as_str().or(ev["response"].as_str()).unwrap_or(""));
+        tools.extend(ev["message"]["tool_calls"].as_array().into_iter().flatten().cloned());
+    }
+    joined(text, tools, model)
+}
+
+/// One OpenAI-shaped response from reassembled stream parts.
+fn joined(text: String, tools: Vec<Value>, model: Value) -> Value {
     let mut msg = json!({ "role": "assistant", "content": if text.is_empty() { Value::Null } else { json!(text) } });
     if !tools.is_empty() {
-        msg["tool_calls"] = Value::Array(tools.into_values().collect());
+        msg["tool_calls"] = Value::Array(tools);
     }
     let mut out = json!({ "choices": [{ "index": 0, "message": msg, "finish_reason": "stop" }] });
     if !model.is_null() {
@@ -435,18 +454,30 @@ fn sse_join(body: &[u8]) -> Value {
     out
 }
 
+/// Streamed responses are stored as raw bytes and reassembled only for reading.
+fn streamed(e: &Ev) -> Option<fn(&[u8]) -> Value> {
+    let ct = e.ctype.as_deref().unwrap_or("");
+    if ct.starts_with("text/event-stream") {
+        Some(sse_join)
+    } else if ct.starts_with("application/x-ndjson") {
+        Some(ndjson_join)
+    } else {
+        None
+    }
+}
+
 /// An event's response as JSON, reassembling SSE when needed.
 fn resp_obj(c: &Connection, e: &Ev) -> R<Value> {
     let body = get(c, &e.resp)?;
-    if e.ctype.as_deref().unwrap_or("").starts_with("text/event-stream") {
-        return Ok(sse_join(&body));
+    if let Some(join) = streamed(e) {
+        return Ok(join(&body));
     }
     Ok(serde_json::from_slice(&body).unwrap_or_else(|_| json!(String::from_utf8_lossy(&body))))
 }
 
 // ---------- diff ----------
 
-/// (text, normalized tool calls) from an OpenAI- or Anthropic-shaped response.
+/// (text, normalized tool calls) from an OpenAI-, Anthropic- or Ollama-shaped response.
 fn assistant_payload(r: &Value) -> (String, Value) {
     if let Some(ch) = r.get("choices") {
         let m = &ch[0]["message"];
@@ -461,6 +492,12 @@ fn assistant_payload(r: &Value) -> (String, Value) {
             .collect();
         return (text, Value::Array(tools));
     }
+    if let Some(m) = r.get("message").filter(|m| m.is_object()) {
+        return (m["content"].as_str().unwrap_or("").into(), norm_tools(&m["tool_calls"])); // Ollama /api/chat
+    }
+    if let Some(t) = r["response"].as_str() {
+        return (t.into(), json!([])); // Ollama /api/generate
+    }
     (r.to_string(), json!([]))
 }
 
@@ -473,8 +510,11 @@ fn norm_tools(tool_calls: &Value) -> Value {
             .flatten()
             .map(|t| {
                 let f = &t["function"];
-                let raw = f["arguments"].as_str().unwrap_or("null");
-                json!({ "name": f["name"], "args": serde_json::from_str::<Value>(raw).unwrap_or_else(|_| json!(raw)) })
+                let args = match &f["arguments"] {
+                    Value::String(raw) => serde_json::from_str::<Value>(raw).unwrap_or_else(|_| json!(raw)),
+                    v => v.clone(), // Ollama sends arguments as an object
+                };
+                json!({ "name": f["name"], "args": args })
             })
             .collect(),
     )
@@ -717,7 +757,7 @@ fn cell(c: &Connection, e: &Ev, who: &str, sources: &str, span: bool) -> R<Strin
     if e.status != 200 {
         facts.push(format!(r#"<span class="bad">HTTP {}</span>"#, e.status));
     }
-    let streamed = e.ctype.as_deref().unwrap_or("").starts_with("text/event-stream");
+    let streamed = streamed(e).is_some();
     let (summary, evidence) = if e.typ == "effect" {
         (
             format!("Returned <code>{}</code>", esc(&clip(&resp.to_string(), 200))),
@@ -930,6 +970,7 @@ fn step_text(c: &Connection, e: &Ev) -> R<String> {
         if let Some(last) = req["messages"].as_array().and_then(|m| m.last()) {
             strings(last, &mut out);
         }
+        out.extend(req["prompt"].as_str().map(str::to_string)); // Ollama /api/generate
         let (text, tools) = assistant_payload(&resp);
         out.extend([text, tool_line(&tools)]);
     }
@@ -2116,5 +2157,77 @@ mod tests {
         assert_matches_schema("eval_run", &r["structuredContent"]);
         assert_eq!(r["structuredContent"]["regressions"], json!(["m1"]));
         assert_eq!(call(&c, "eval_run", json!({ "run": "b1", "checks": [{}] }))["isError"], true);
+    }
+
+    // local LLMs: Ollama's native API (OpenAI-compatible local servers are covered by the tests above)
+
+    fn ollama(req: &Value) -> (Vec<u8>, &'static str) {
+        let model = req["model"].as_str().unwrap_or("");
+        let generate = req.get("prompt").is_some();
+        let say = |s: &str| if generate { json!({ "model": model, "response": s, "done": false }) } else { json!({ "model": model, "message": { "role": "assistant", "content": s }, "done": false }) };
+        let call = json!({ "model": model, "message": { "role": "assistant", "content": "", "tool_calls": [{ "function": { "name": "lookup", "arguments": { "city": "Ogden" } } }] }, "done": false });
+        if req["stream"] == false {
+            let mut one = say(&format!("Weather check with {model}"));
+            one["done"] = json!(true);
+            if !generate {
+                one["message"]["tool_calls"] = call["message"]["tool_calls"].clone();
+            }
+            return (canon(&one), "application/json; charset=utf-8");
+        }
+        let mut lines = vec![say("Weather "), say(&format!("check with {model}"))];
+        if !generate {
+            lines.push(call);
+        }
+        lines.push(json!({ "model": model, "done": true, "eval_count": 12 }));
+        (lines.iter().flat_map(|l| [canon(l), b"\n".to_vec()].concat()).collect(), "application/x-ndjson")
+    }
+
+    #[test]
+    fn ollama_native_chat_and_generate_record_replay_and_read() {
+        let db = tmpdb();
+        let up = stub(ollama);
+        let rec = proxy(&db, "record", "local", Some(up), None, None);
+        let msgs = json!([{ "role": "user", "content": "weather in Ogden?" }]);
+        let (_, streamed) = post(rec, "/api/chat", &json!({ "model": "llama3.2", "messages": msgs }));
+        let (_, plain) = post(rec, "/api/chat", &json!({ "model": "llama3.2", "messages": msgs, "stream": false }));
+        let (_, generated) = post(rec, "/api/generate", &json!({ "model": "llama3.2", "prompt": "say hi" }));
+
+        let rep = proxy(&db, "replay", "again", None, Some("local"), None);
+        assert_eq!(post(rep, "/api/chat", &json!({ "model": "llama3.2", "messages": msgs })).1, streamed, "NDJSON replays byte-identically");
+        assert_eq!(post(rep, "/api/chat", &json!({ "model": "llama3.2", "messages": msgs, "stream": false })).1, plain);
+        assert_eq!(post(rep, "/api/generate", &json!({ "model": "llama3.2", "prompt": "say hi" })).1, generated);
+
+        let c = open_ro(&db).unwrap();
+        for step in [0, 1] {
+            let s = step_json(&c, "local", step).unwrap();
+            assert_eq!(s["text"], "Weather check with llama3.2", "step {step}: {s}");
+            assert_eq!(s["tool_calls"], json!([{ "name": "lookup", "args": { "city": "Ogden" } }]), "step {step}");
+        }
+        assert_eq!(step_json(&c, "local", 2).unwrap()["text"], "Weather check with llama3.2");
+        assert_eq!(hits(&search(&c, "Ogden", None, 10).unwrap()).len(), 4, "prompt, args indexed: {}", search(&c, "Ogden", None, 10).unwrap());
+        assert_eq!(hits(&search(&c, "say hi", Some("local"), 10).unwrap()), [("local".to_string(), 2)], "generate prompt indexed");
+        let r = eval_json(&c, "local", &json!([
+            { "name": "names the model", "step": 0, "includes": ["llama3.2"] },
+            { "name": "lookup args", "tool": "lookup", "schema": { "type": "object", "required": ["city"], "properties": { "city": { "type": "string" } } } },
+        ]), None).unwrap();
+        assert_eq!(r["passed"], 2, "{r}");
+        let html = render_view(&c, &["local".into()]).unwrap();
+        assert!(html.contains("Response (reassembled from a stream)"));
+        assert!(html.contains(r#"<p class="sum">Weather check with llama3.2</p>"#), "reassembled text is the step summary");
+        assert!(html.contains("&quot;city&quot;: &quot;Ogden&quot;"), "tool call args appear in the evidence");
+    }
+
+    #[test]
+    fn ollama_fork_swaps_the_local_model_and_diffs() {
+        let db = tmpdb();
+        let up = stub(ollama);
+        let msgs = json!([{ "role": "user", "content": "weather in Ogden?" }]);
+        let rec = proxy(&db, "record", "base", Some(up), None, None);
+        post(rec, "/api/chat", &json!({ "model": "llama3.2", "messages": msgs }));
+        let frk = proxy(&db, "fork", "qwen", Some(up), Some("base"), Some("qwen2.5"));
+        post(frk, "/api/chat", &json!({ "model": "llama3.2", "messages": msgs, "options": { "temperature": 0 } }));
+        let (report, first, _, _) = diff_report(&open_ro(&db).unwrap(), "base", "qwen").unwrap();
+        assert_eq!(first, Some(0));
+        assert!(report.contains("[-llama3.2-] {+qwen2.5+}"), "{report}");
     }
 }
