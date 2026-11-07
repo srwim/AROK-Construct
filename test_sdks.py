@@ -131,7 +131,9 @@ class TestSDKs(unittest.TestCase):
         live = run(self.serve("record", "base", upstream=self.upstream))
         self.assertEqual(live, ("reply 1 from claude-test", "reply 1 from claude-test "))
         self.assertEqual(Stub.seen[0].get("anthropic-beta"), "test-beta-2026")
-        self.assertEqual(Stub.seen[0].get("x-api-key"), SECRET)
+        # anthropic 2.x sends the key as a bearer token; older versions as x-api-key. Either must pass through.
+        auth = {Stub.seen[0].get("x-api-key"), Stub.seen[0].get("authorization")}
+        self.assertTrue(auth & {SECRET, f"Bearer {SECRET}"}, auth)
         self.up.shutdown()
         self.assertEqual(run(self.serve("replay", "r1", parent="base")), live)
         self.no_secrets_stored()
