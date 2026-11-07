@@ -4,13 +4,14 @@
 //! the proxy (`OPENAI_BASE_URL=http://127.0.0.1:8787/v1`) and run your agent.
 //! FORMAT.md is the storage contract; this file is its implementation.
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use similar::{capture_diff_slices, Algorithm, DiffTag, TextDiff};
 use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
-use std::io::Read;
+use std::fmt::Write as _;
+use std::io::{Read, Write as _};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -25,6 +26,7 @@ usage:
   construct diff   RUN_A RUN_B                              divergence report
   construct view   RUN [RUN...] [-o timeline.html]          HTML timeline
   construct runs                                            list recorded runs
+  construct mcp                                             MCP server on stdio (read-only)
 
 env: CONSTRUCT_DB (default ./construct.db), CONSTRUCT_UPSTREAM (default for --upstream)";
 
@@ -506,10 +508,15 @@ fn udiff(a: &Value, b: &Value) -> String {
     udiff_raw(a, b).lines().map(|l| format!("      {l}")).collect::<Vec<_>>().join("\n")
 }
 
-fn cmd_diff(c: &Connection, ra: &str, rb: &str) -> R<()> {
+/// Divergence report: (text, first divergent step, steps in A, steps in B).
+fn diff_report(c: &Connection, ra: &str, rb: &str) -> R<(String, Option<usize>, usize, usize)> {
     let (ca, cb) = (timeline(c, ra)?, timeline(c, rb)?);
+    let mut out = String::new();
+    macro_rules! println {
+        ($($t:tt)*) => { writeln!(out, $($t)*).expect("writing to a String never fails") };
+    }
     println!("diff {ra} ({} steps) <-> {rb} ({} steps)", ca.len(), cb.len());
-    let mut diverged = false;
+    let mut diverged = None;
     for i in 0..ca.len().max(cb.len()) {
         let (ea, eb) = (ca.get(i), cb.get(i));
         if let (Some(x), Some(y)) = (ea, eb) {
@@ -518,8 +525,8 @@ fn cmd_diff(c: &Connection, ra: &str, rb: &str) -> R<()> {
                 continue;
             }
         }
-        if !diverged {
-            diverged = true;
+        if diverged.is_none() {
+            diverged = Some(i);
             println!("! first divergence at step {i}");
         }
         let (Some(x), Some(y)) = (ea, eb) else {
@@ -558,9 +565,14 @@ fn cmd_diff(c: &Connection, ra: &str, rb: &str) -> R<()> {
             println!("~ step {i}  tool calls (schema-aware):\n{}", udiff(&tools_a, &tools_b));
         }
     }
-    if !diverged {
+    if diverged.is_none() {
         println!("runs are identical");
     }
+    Ok((out, diverged, ca.len(), cb.len()))
+}
+
+fn cmd_diff(c: &Connection, ra: &str, rb: &str) -> R<()> {
+    print!("{}", diff_report(c, ra, rb)?.0);
     Ok(())
 }
 
@@ -862,19 +874,193 @@ fn cmd_view(c: &Connection, runs: &[String], out: &str) -> R<()> {
     Ok(())
 }
 
-fn cmd_runs(c: &Connection) -> R<()> {
+fn runs_json(c: &Connection) -> R<Value> {
     let mut st = c.prepare(
-        "SELECT name, mode, (SELECT count(*) FROM events WHERE run = runs.name),
-                strftime('%Y-%m-%d %H:%M', ts, 'unixepoch', 'localtime'), parent
+        "SELECT name, mode, parent, model_sub, strftime('%Y-%m-%d %H:%M', ts, 'unixepoch', 'localtime'),
+                (SELECT count(*) FROM events WHERE run = runs.name),
+                (SELECT count(*) FROM events WHERE run = runs.name AND src = 'live')
          FROM runs ORDER BY name",
     )?;
     let rows = st.query_map([], |r| {
-        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?, r.get::<_, Option<String>>(4)?))
+        Ok(json!({
+            "name": r.get::<_, String>(0)?, "mode": r.get::<_, String>(1)?,
+            "parent": r.get::<_, Option<String>>(2)?, "model_sub": r.get::<_, Option<String>>(3)?,
+            "recorded": r.get::<_, String>(4)?, "steps": r.get::<_, i64>(5)?, "live": r.get::<_, i64>(6)?,
+        }))
     })?;
-    for row in rows {
-        let (name, mode, n, when, parent) = row?;
-        let parent = parent.map(|p| format!(" <- {p}")).unwrap_or_default();
-        println!("{name:24} {mode:7} {n:3} steps  {when}{parent}");
+    Ok(Value::Array(rows.collect::<Result<_, _>>()?))
+}
+
+fn cmd_runs(c: &Connection) -> R<()> {
+    for r in runs_json(c)?.as_array().into_iter().flatten() {
+        let parent = r["parent"].as_str().map(|p| format!(" <- {p}")).unwrap_or_default();
+        let (name, mode, when) = (r["name"].as_str().unwrap_or(""), r["mode"].as_str().unwrap_or(""), r["recorded"].as_str().unwrap_or(""));
+        println!("{name:24} {mode:7} {:3} steps  {when}{parent}", r["steps"]);
+    }
+    Ok(())
+}
+
+// ---------- MCP server: read-only access to the log for any MCP client (stdio, JSON-RPC 2.0) ----------
+
+const MCP_VERSIONS: [&str; 3] = ["2025-06-18", "2025-03-26", "2024-11-05"];
+
+/// The MCP server never writes: the log is evidence, and an agent reading it must not be able to change it.
+fn open_ro(path: &str) -> R<Connection> {
+    let c = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX)
+        .map_err(|e| format!("cannot open {path} read-only: {e}"))?;
+    c.busy_timeout(Duration::from_secs(10))?;
+    Ok(c)
+}
+
+fn mcp_tools() -> Value {
+    let s = |d: &str| json!({ "type": "string", "description": d });
+    let run = s("Run name, as listed by list_runs.");
+    let nullable = |t: &str| json!({ "type": [t, "null"] });
+    let ro = json!({ "readOnlyHint": true, "idempotentHint": true, "openWorldHint": false });
+    json!([
+        {
+            "name": "list_runs",
+            "title": "List recorded runs",
+            "description": "Every recorded agent run: mode (record, replay, fork), parent run, substituted model, \
+                            when it was recorded, and how many steps were live versus replayed.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false },
+            "outputSchema": { "type": "object", "required": ["runs"], "properties": { "runs": { "type": "array", "items": {
+                "type": "object",
+                "required": ["name", "mode", "parent", "model_sub", "recorded", "steps", "live"],
+                "properties": {
+                    "name": { "type": "string" }, "mode": { "type": "string", "enum": ["record", "replay", "fork"] },
+                    "parent": nullable("string"), "model_sub": nullable("string"), "recorded": { "type": "string" },
+                    "steps": { "type": "integer" }, "live": { "type": "integer" },
+                },
+            } } } },
+            "annotations": ro,
+        },
+        {
+            "name": "get_step",
+            "title": "Get one step's evidence",
+            "description": "One step of a run: the exact request and response (streams reassembled), \
+                            the assistant text and tool calls, model, HTTP status, and whether it was live or replayed.",
+            "inputSchema": {
+                "type": "object", "required": ["run", "step"], "additionalProperties": false,
+                "properties": { "run": run, "step": { "type": "integer", "minimum": 0, "description": "Zero-based step number." } },
+            },
+            "outputSchema": {
+                "type": "object",
+                "required": ["run", "step", "steps", "type", "label", "src", "status", "model", "text", "tool_calls", "request", "response", "key"],
+                "properties": {
+                    "run": { "type": "string" }, "step": { "type": "integer" }, "steps": { "type": "integer" },
+                    "type": { "type": "string", "enum": ["llm_call", "effect"] }, "label": { "type": "string" },
+                    "src": { "type": "string", "enum": ["live", "replayed"] }, "status": { "type": "integer" },
+                    "model": nullable("string"), "text": { "type": "string" },
+                    "tool_calls": { "type": "array", "items": { "type": "object", "required": ["name", "args"] } },
+                    "request": {}, "response": {}, "key": { "type": "string" },
+                },
+            },
+            "annotations": ro,
+        },
+        {
+            "name": "diff_runs",
+            "title": "Diff two runs",
+            "description": "Where two runs of an agent diverge: the first differing step, then request, response \
+                            (word-level), and tool-call (schema-aware) differences for every step after it.",
+            "inputSchema": {
+                "type": "object", "required": ["run_a", "run_b"], "additionalProperties": false,
+                "properties": { "run_a": run.clone(), "run_b": run },
+            },
+            "outputSchema": {
+                "type": "object", "required": ["run_a", "run_b", "steps_a", "steps_b", "first_divergence", "report"],
+                "properties": {
+                    "run_a": { "type": "string" }, "run_b": { "type": "string" },
+                    "steps_a": { "type": "integer" }, "steps_b": { "type": "integer" },
+                    "first_divergence": nullable("integer"), "report": { "type": "string" },
+                },
+            },
+            "annotations": ro,
+        },
+    ])
+}
+
+fn step_json(c: &Connection, run: &str, i: usize) -> R<Value> {
+    let tl = timeline(c, run)?;
+    let e = tl.get(i).ok_or_else(|| format!("run '{run}' has {} steps; step {i} does not exist", tl.len()))?;
+    let (req, resp) = (jget(c, &e.req)?, resp_obj(c, e)?);
+    let llm = e.typ == "llm_call";
+    let (text, tools) = if llm { assistant_payload(&resp) } else { (String::new(), json!([])) };
+    Ok(json!({
+        "run": run, "step": i, "steps": tl.len(), "type": e.typ, "label": e.label(), "src": src_label(e),
+        "status": e.status, "model": if llm { req["model"].clone() } else { Value::Null },
+        "text": text, "tool_calls": tools, "request": req, "response": resp, "key": e.key,
+    }))
+}
+
+/// None: no such tool. Some(Err): the tool ran and failed, reported to the model as `isError`.
+fn mcp_call(c: &Connection, name: &str, a: &Value) -> Option<R<Value>> {
+    let s = |k: &str| a[k].as_str().ok_or_else(|| Box::<dyn Error>::from(format!("'{k}' must be a string")));
+    Some(match name {
+        "list_runs" => runs_json(c).map(|r| json!({ "runs": r })),
+        "get_step" => (|| step_json(c, s("run")?, a["step"].as_u64().ok_or("'step' must be a non-negative integer")? as usize))(),
+        "diff_runs" => (|| {
+            let (ra, rb) = (s("run_a")?, s("run_b")?);
+            let (report, first, na, nb) = diff_report(c, ra, rb)?;
+            Ok(json!({ "run_a": ra, "run_b": rb, "steps_a": na, "steps_b": nb, "first_divergence": first, "report": report }))
+        })(),
+        _ => return None,
+    })
+}
+
+/// One JSON-RPC message in, at most one reply out (notifications and stray responses get none).
+fn mcp_handle(c: &Connection, msg: &Value) -> Option<Value> {
+    let (id, method) = (msg.get("id")?.clone(), msg.get("method")?.as_str().unwrap_or(""));
+    let ok = |result: Value| json!({ "jsonrpc": "2.0", "id": id, "result": result });
+    let err = |code: i64, m: String| json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": m } });
+    Some(match method {
+        "initialize" => {
+            let asked = msg["params"]["protocolVersion"].as_str().unwrap_or("");
+            let version = MCP_VERSIONS.iter().find(|v| **v == asked).unwrap_or(&MCP_VERSIONS[0]);
+            ok(json!({
+                "protocolVersion": version,
+                "capabilities": { "tools": {} },
+                "serverInfo": { "name": "arok-construct", "title": "AROK Construct", "version": env!("CARGO_PKG_VERSION") },
+                "instructions": "Read-only access to recorded LLM agent runs. Start with list_runs; \
+                                 use diff_runs to find where two runs diverge and get_step for the exact evidence.",
+            }))
+        }
+        "ping" => ok(json!({})),
+        "tools/list" => ok(json!({ "tools": mcp_tools() })),
+        "tools/call" => {
+            let name = msg["params"]["name"].as_str().unwrap_or("");
+            let args = msg["params"].get("arguments").cloned().unwrap_or_else(|| json!({}));
+            match mcp_call(c, name, &args) {
+                None => err(-32602, format!("unknown tool '{name}'")),
+                Some(Ok(v)) => {
+                    let text = v["report"].as_str().map_or_else(|| pretty(&v), str::to_string);
+                    ok(json!({ "content": [{ "type": "text", "text": text }], "structuredContent": v }))
+                }
+                Some(Err(e)) => ok(json!({ "content": [{ "type": "text", "text": format!("construct: {e}") }], "isError": true })),
+            }
+        }
+        m => err(-32601, format!("method not found: {m}")),
+    })
+}
+
+// ponytail: one message per line, handled in order; JSON-RPC batches (dropped in MCP 2025-06-18) are not supported
+fn cmd_mcp(c: &Connection) -> R<()> {
+    let stdout = std::io::stdout();
+    for line in std::io::stdin().lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let reply = match serde_json::from_str::<Value>(&line) {
+            Ok(msg) => mcp_handle(c, &msg),
+            Err(e) => Some(json!({ "jsonrpc": "2.0", "id": null, "error": { "code": -32700, "message": format!("parse error: {e}") } })),
+        };
+        if let Some(r) = reply {
+            let mut out = stdout.lock();
+            out.write_all(&canon(&r))?;
+            out.write_all(b"\n")?;
+            out.flush()?;
+        }
     }
     Ok(())
 }
@@ -897,7 +1083,7 @@ fn cli(args: &[String]) -> R<()> {
         "replay" => &["--run", "--from", "--port"],
         "fork" => &["--run", "--from", "--upstream", "--model", "--port"],
         "view" => &["-o", "--out"],
-        "diff" | "runs" => &[],
+        "diff" | "runs" | "mcp" => &[],
         "help" | "-h" | "--help" => {
             println!("{USAGE}");
             return Ok(());
@@ -918,6 +1104,7 @@ fn cli(args: &[String]) -> R<()> {
             cmd_view(&open(&db_path())?, &pos, out)
         }
         "runs" => cmd_runs(&open(&db_path())?),
+        "mcp" => cmd_mcp(&open_ro(&db_path())?),
         mode => {
             if !pos.is_empty() {
                 return Err(format!("{mode}: unexpected argument '{}'", pos[0]).into());
@@ -1315,5 +1502,110 @@ mod tests {
     fn assistant_payload_anthropic() {
         let resp = json!({"content": [{"type": "text", "text": "hi"}, {"type": "tool_use", "name": "f", "input": {"a": 1}}]});
         assert_eq!(assistant_payload(&resp), ("hi".into(), json!([{"name": "f", "args": {"a": 1}}])));
+    }
+
+    // mcp
+
+    fn rpc(c: &Connection, method: &str, params: Value) -> Value {
+        mcp_handle(c, &json!({ "jsonrpc": "2.0", "id": 7, "method": method, "params": params })).expect("requests get a reply")
+    }
+
+    fn call(c: &Connection, tool: &str, args: Value) -> Value {
+        rpc(c, "tools/call", json!({ "name": tool, "arguments": args }))["result"].clone()
+    }
+
+    #[test]
+    fn mcp_initialize_negotiates_version() {
+        let c = open(&tmpdb()).unwrap();
+        let r = rpc(&c, "initialize", json!({ "protocolVersion": "2025-03-26", "capabilities": {}, "clientInfo": { "name": "t", "version": "1" } }));
+        assert_eq!(r["id"], 7);
+        assert_eq!(r["result"]["protocolVersion"], "2025-03-26", "a supported version is echoed");
+        assert_eq!(r["result"]["capabilities"], json!({ "tools": {} }));
+        let r = rpc(&c, "initialize", json!({ "protocolVersion": "1999-01-01" }));
+        assert_eq!(r["result"]["protocolVersion"], MCP_VERSIONS[0], "unknown versions get the latest");
+        assert_eq!(rpc(&c, "ping", json!({}))["result"], json!({}));
+    }
+
+    #[test]
+    fn mcp_notifications_get_no_reply_and_unknowns_are_errors() {
+        let c = open(&tmpdb()).unwrap();
+        assert!(mcp_handle(&c, &json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })).is_none());
+        assert!(mcp_handle(&c, &json!({ "jsonrpc": "2.0", "id": 1, "result": {} })).is_none(), "stray responses are ignored");
+        assert_eq!(rpc(&c, "resources/list", json!({}))["error"]["code"], -32601);
+        assert_eq!(rpc(&c, "tools/call", json!({ "name": "rm_rf" }))["error"]["code"], -32602);
+    }
+
+    #[test]
+    fn mcp_tools_are_read_only_and_declare_schemas() {
+        let c = open(&tmpdb()).unwrap();
+        let tools = rpc(&c, "tools/list", json!({}))["result"]["tools"].clone();
+        let names: Vec<&str> = tools.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["list_runs", "get_step", "diff_runs"]);
+        for t in tools.as_array().unwrap() {
+            assert_eq!(t["annotations"]["readOnlyHint"], true);
+            assert_eq!(t["inputSchema"]["type"], "object");
+            assert_eq!(t["outputSchema"]["type"], "object");
+        }
+    }
+
+    /// Every required field the tool's outputSchema names is present in its structuredContent.
+    fn assert_matches_schema(tool: &str, v: &Value) {
+        let tools = mcp_tools();
+        let schema = &tools.as_array().unwrap().iter().find(|t| t["name"] == tool).unwrap()["outputSchema"];
+        for k in schema["required"].as_array().unwrap() {
+            assert!(v.get(k.as_str().unwrap()).is_some(), "{tool}: missing required field {k}");
+        }
+    }
+
+    #[test]
+    fn mcp_tools_answer_from_the_log() {
+        let db = tmpdb();
+        base_and_fork(&db);
+        let c = open_ro(&db).unwrap();
+
+        let r = call(&c, "list_runs", json!({}));
+        assert_matches_schema("list_runs", &r["structuredContent"]);
+        let runs = r["structuredContent"]["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2);
+        let b1 = runs.iter().find(|r| r["name"] == "b1").unwrap();
+        assert_eq!(b1["parent"], "base");
+        assert_eq!(b1["model_sub"], "m2");
+        assert_eq!((b1["steps"].as_i64(), b1["live"].as_i64()), (Some(3), Some(2)));
+
+        let r = call(&c, "get_step", json!({ "run": "b1", "step": 1 }));
+        let s = &r["structuredContent"];
+        assert_matches_schema("get_step", s);
+        assert_eq!((s["src"].as_str(), s["model"].as_str(), s["text"].as_str()), (Some("live"), Some("m2"), Some("reply-2 model=m2")));
+        assert!(r.get("isError").is_none());
+
+        let r = call(&c, "diff_runs", json!({ "run_a": "base", "run_b": "b1" }));
+        assert_matches_schema("diff_runs", &r["structuredContent"]);
+        assert_eq!(r["structuredContent"]["first_divergence"], 1);
+        assert!(r["content"][0]["text"].as_str().unwrap().contains("! first divergence at step 1"), "text is the report");
+    }
+
+    #[test]
+    fn mcp_tool_failures_are_reported_to_the_model() {
+        let db = tmpdb();
+        base_and_fork(&db);
+        let c = open_ro(&db).unwrap();
+        for (tool, args, says) in [
+            ("get_step", json!({ "run": "b1", "step": 99 }), "has 3 steps"),
+            ("get_step", json!({ "run": "nope", "step": 0 }), "no such run"),
+            ("get_step", json!({ "run": "b1", "step": -1 }), "non-negative integer"),
+            ("diff_runs", json!({ "run_a": "base" }), "'run_b' must be a string"),
+        ] {
+            let r = call(&c, tool, args);
+            assert_eq!(r["isError"], true, "{tool}");
+            assert!(r["content"][0]["text"].as_str().unwrap().contains(says), "{tool}: {}", r["content"][0]["text"]);
+        }
+    }
+
+    #[test]
+    fn mcp_connection_cannot_write() {
+        let db = tmpdb();
+        base_and_fork(&db);
+        assert!(open_ro(&db).unwrap().execute("INSERT INTO objects (hash, data) VALUES ('x', x'00')", []).is_err());
+        assert!(open_ro(&tmpdb()).is_err(), "a missing database is an error, not a new empty file");
     }
 }

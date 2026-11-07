@@ -41,6 +41,7 @@ construct fork   --run b1 --from base --upstream ... --model gpt-x
 construct diff   base b1                               # divergence report
 construct view   base b1 -o timeline.html              # visual timeline
 construct runs                                         # list recorded runs
+construct mcp                                          # MCP server on stdio (read-only)
 ```
 
 `CONSTRUCT_DB` picks the database (default `./construct.db`). Client headers
@@ -58,6 +59,36 @@ search = construct.wrap(search)   # args/result must be JSON-serializable
 
 `construct.py` is the whole Python SDK: stdlib only, also exposes
 `construct.serve(...)` to start the proxy from Python.
+
+## Ask an agent about its own runs (MCP)
+
+`construct mcp` serves the log to any MCP client (Claude Desktop, Claude Code,
+Cursor) over stdio. The connection is opened read-only at the SQLite level, so
+an agent can investigate the evidence but never alter it.
+
+| Tool | Returns |
+|---|---|
+| `list_runs` | every run: mode, parent, substituted model, live vs replayed steps |
+| `get_step` | one step's exact request and response, assistant text, tool calls |
+| `diff_runs` | first divergence between two runs and the full divergence report |
+
+Each tool declares an `outputSchema` and returns typed `structuredContent`
+alongside readable text. Failures (unknown run, step out of range) come back
+as tool errors the model can read and correct, not protocol errors.
+
+```sh
+claude mcp add construct -e CONSTRUCT_DB=/path/to/construct.db -- construct mcp
+```
+
+Claude Desktop (`claude_desktop_config.json`):
+
+```json
+{ "mcpServers": { "construct": {
+    "command": "C:\\tools\\construct.exe", "args": ["mcp"],
+    "env": { "CONSTRUCT_DB": "C:\\agents\\construct.db" } } } }
+```
+
+Then ask: "Where did run b1 diverge from base, and what did the model do differently?"
 
 ## How it works
 
